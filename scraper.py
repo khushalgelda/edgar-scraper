@@ -65,16 +65,11 @@ def parse_master_idx(url):
             i = i + 1
     print('Total Filings: {}'.format(i))
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        daily_objects_post = executor.map(add_doc_url, daily_objects_pre)
-
-    # print(json.loads(json.dumps(daily_dict[pipe_split[0]])))
-    # for x in daily_objects_post:
-    #     print(type(x.cik))
-    #     print(x.form_type)
-    #     print(x.date_filed)
-    #     print(x.html_link)
-    #     print(x.doc_link)
-    return daily_objects_post
+        # daily_objects_post = executor.map(add_doc_url, daily_objects_pre)
+        daily_objects_post = [executor.submit(add_doc_url, obj) for obj in daily_objects_pre]
+        # for x in concurrent.futures.as_completed(daily_objects_post):
+        #     print(x.result().cik)
+    # return daily_objects_post
 
 
 def create_url(baseurl, date):
@@ -102,8 +97,8 @@ def crawl_url(baseurl, start_date, end_date):
 
 
 def main():
-    crawl_url(base_url, datetime.datetime(2021, 2, 22),
-              datetime.datetime(2021, 2, 22))
+    crawl_url(base_url, datetime.datetime(2021, 1, 1),
+              datetime.datetime(2021, 1, 31))
 
 
 if __name__ == '__main__':
