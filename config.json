@@ -1,0 +1,21 @@
+{
+  "query": {
+    "start_year": 2021,
+    "start_month": 1,
+    "start_date": 1,
+    "end_year": 2021,
+    "end_month": 1,
+    "end_date": 31,
+    "base_url": "https://www.sec.gov/Archives/edgar/daily-index/",
+    "ticker_cik_map_link": "https://www.sec.gov/include/ticker.txt"
+  },
+
+  "database":{
+    "write_batch_size": 100,
+    "db": "mydb",
+    "max_connections": 32,
+    "stale_timeout": 300,
+    "user": "root",
+    "password": "root"
+  }
+}

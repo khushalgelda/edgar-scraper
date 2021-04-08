@@ -1,12 +1,66 @@
 import concurrent.futures
 import datetime
+import json
 import os
 
+import peewee
 import requests
+import yaml
 from bs4 import BeautifulSoup as soup
-from peewee import chunked
+from playhouse.db_url import connect
 from ratemate import RateLimit
-from models import EdgarEntry, db, create_tbls, CIK
+
+database_proxy = peewee.DatabaseProxy()
+
+
+class Database:
+    def __init__(self, db, user, passwd, max_connections=32, stale_timeout=32):
+        self.db = db
+        self.user = user
+        self.passwd = passwd
+        self.max_connection = max_connections
+        self.stale_timeout = stale_timeout
+        database_proxy.initialize(self.get_db())
+
+    def get_db(self):
+        return connect(os.environ.get('DATABASE') or 'mysql://root:root@0.tcp.ngrok.io:13604/mydb')
+
+
+class BaseModel(peewee.Model):
+    """A base model that will use our MySQL database"""
+    created = peewee.DateTimeField(default=datetime.datetime.now())
+
+    class Meta:
+        database = database_proxy
+
+
+class CIK(BaseModel):
+    cik = peewee.IntegerField()
+    ticker = peewee.CharField(max_length=15)
+    indexes = (
+        (('cik', 'ticker'), True),
+    )
+
+    def __enter__(self):
+        return self
+
+
+class EdgarEntry(BaseModel):
+    cik = peewee.ForeignKeyField(CIK, backref='entries')
+    form_type = peewee.CharField(max_length=10)
+    date = peewee.DateTimeField()
+    html_link = peewee.CharField()
+    doc_link = peewee.CharField()
+
+    def __enter__(self):
+        return self
+
+
+# simple utility function to create tables
+def create_tbls():
+    with database_proxy:
+        database_proxy.create_tables([CIK, EdgarEntry])
+
 
 base_url = 'https://www.sec.gov/Archives/edgar/daily-index/'
 rate_limit = RateLimit(max_count=10, per=1)
@@ -15,6 +69,8 @@ rate_limit = RateLimit(max_count=10, per=1)
 # refresh this map in load_cik_ticker
 ticker_to_cik = {}
 cik_to_ticker = {}
+cik_to_ticker_existing_records = {}
+ticker_to_cik_existing_records = {}
 
 
 class Entry:
@@ -27,33 +83,41 @@ class Entry:
 
 
 def load_cik_ticker():
-    print('Loading ticker and CIK mappings in the database...')
+    # extract existing cik to ticker mappings from db
+    print('Extract existing cik to ticker mappings from CIK table in DB')
+    cik_ticker_query = CIK.select()
+    for record in cik_ticker_query:
+        cik_to_ticker_existing_records[record.cik] = [record.ticker, record.id]
+        ticker_to_cik_existing_records[record.ticker] = [record.cik, record.id]
+
     ticker_cik_map_link = 'https://www.sec.gov/include/ticker.txt'
+    print('Fetching ticker and CIK mapping from', ticker_cik_map_link)
     response = requests.get(ticker_cik_map_link)
     decoded_response = response.text
+
     pks = []  # primary keys
-    rows = []
     counter = 0
+
+    print('Building a dictionary for ticker and CIK mappings')
     for x in decoded_response.split('\n'):
         tkr = x.split('\t')[0]
-        cik = x.split('\t')[1]
-        ticker_to_cik[tkr] = [cik]
-        cik_to_ticker[cik] = [tkr]
-        rows.append(CIK(ticker=tkr, cik=cik))
-
-    print(len(rows), 'ticker to CIK mappings found on', ticker_cik_map_link)
-    for cik in cik_to_ticker:
-        pk = CIK.insert(ticker=cik_to_ticker[cik][0], cik=cik).on_conflict_replace().execute()
-        ticker_to_cik[cik_to_ticker[cik][0]].append(pk)
-        cik_to_ticker[cik].append(pk)
-
+        cik = int(x.split('\t')[1])
+        cik_create_if_not_exists(cik, tkr)
         counter += 1
-        if counter % 500 == 0:
-            print('{} tiker and CIK loaded'.format(counter))
-    print('ticker and CIK mapping load COMPLETE')
-    # print('db is assigned to %r' % db)
-    # with db.atomic:
-    #     CIK.bulk_create(rows, batch_size=500)
+    print(counter, 'ticker to CIK mappings loaded in memory for fast access')
+
+
+def cik_create_if_not_exists(cik, tkr):
+    if cik not in cik_to_ticker_existing_records:
+        print('New CIK', cik, ' to Ticker', tkr,
+              ' mapping found. Inserting to DB')
+        try:
+            pk = CIK.insert(ticker=tkr, cik=cik).execute()
+        except Exception as e:
+            print('exception occured', e, tkr, cik)
+        if tkr != 'n/a':
+            ticker_to_cik_existing_records[tkr] = [cik, pk]
+        cik_to_ticker_existing_records[cik] = [tkr, pk]
 
 
 def insert_new_cik(ticker):
@@ -62,7 +126,7 @@ def insert_new_cik(ticker):
     decoded_response = response.text
     for x in decoded_response.split('\n'):
         tkr = x.split('\t')[0]
-        cik = x.split('\t')[1]
+        cik = int(x.split('\t')[1])
         if ticker is not None and ticker == tkr:
             CIK.insert(ticker=tkr, cik=cik).on_conflict_ignore().execute()
             return cik
@@ -70,11 +134,11 @@ def insert_new_cik(ticker):
     return None
 
 
-def cik_exists(ticker):
-    cik = CIK.select().where(ticker=ticker)
-    if cik is None or cik.cik is None:
+def get_cik_for(ticker):
+    query = CIK.select().where(ticker=ticker)
+    if query is None or query.cik is None:
         return insert_new_cik(ticker)
-    return cik
+    return query.cik
 
 
 def add_doc_link_to_obj(obj):
@@ -112,36 +176,50 @@ def get_edgar_daily_objects(url):
             daily_objects_pre.append(obj)
             i = i + 1
     print('Total Filings: {}'.format(i))
-    rows = []
+    return work(daily_objects_pre)
+
+
+def work(daily_objects_pre):
+    start = datetime.datetime.now()
     with concurrent.futures.ThreadPoolExecutor() as executor:
-        # daily_objects_post = executor.map(add_doc_link_to_obj, daily_objects_pre)
         daily_objects_post = {executor.submit(add_doc_link_to_obj, obj) for obj in daily_objects_pre}
-        # with db.atomic:
-        #     CIK.bulk_create(daily_objects_post, batch_size=500)
-        # # CIK.bulk_create(rows, batch_size=500)
 
         for future in concurrent.futures.as_completed(daily_objects_post):
-            entry = future.result()
-            print(entry)
-            try:
-                rows.append({'cik': entry.cik, 'form_type': entry.form_type, 'date': entry.date,
-                             'html_link': entry.html_link, 'doc_link': entry.doc_link})
-            except KeyError:
-                print('The following CIK was not found anymore \n', entry.__str__())
+            if future is None or future.result() is None:
                 continue
-            if rows is not None and len(rows) % 100 == 0:
-                print('writing {} rows to database'.format(len(rows)))
-                with db.atomic():
-                    EdgarEntry.insert_many(rows, fields=[EdgarEntry.cik, EdgarEntry.form_type, EdgarEntry.date,
-                                                          EdgarEntry.html_link, EdgarEntry.doc_link]).execute()
-                rows = []
+            # print('cik=', int(future.result().cik), 'form_type=', future.result().form_type, 'date=',
+            #       future.result().date_filed,
+            #       'doc_link=', future.result().doc_link)
+            print('Fetching filings for', future.result().date_filed, '...')
+            while True:
+                try:
+                    EdgarEntry.insert(cik=cik_to_ticker_existing_records[int(future.result().cik)][1],
+                                      form_type=future.result().form_type, date=future.result().date_filed,
+                                      html_link=future.result().html_link, doc_link=future.result().doc_link).execute()
+                    break
+                except KeyError:
+                    cik_create_if_not_exists(int(future.result().cik), 'n/a')
+                    try:
+                        write_to_file("missing_ticker.txt", str(future.result().cik))
+                    except Exception as e:
+                        print(e)
+    try:
+        write_to_file("last_day_done.txt", future.result().date_filed)
+    except Exception as e:
+        print(e)
 
-        if len(rows) < 100:
-            print('writing {} rows to database'.format(len(rows)))
-            with db.atomic():
-                EdgarEntry.insert_many(rows).execute()
-        print('done backilling for a day')
-    return daily_objects_post
+    print('Fetching completed for', future.result().date_filed)
+    end = (datetime.datetime.now() - start)
+    print(end, "seconds")
+    print(end / 60, "minutes")
+    print(end / 24, "hours")
+
+
+def write_to_file(file, mssg):
+    f = open(file, "a")
+    f.write(mssg)
+    f.write("\n")
+    f.close()
 
 
 def create_url(baseurl, date):
@@ -157,7 +235,8 @@ def create_url(baseurl, date):
     return url
 
 
-def crawl_url(baseurl, start_date, end_date):
+def crawl_url(baseurl="https://www.sec.gov/Archives/edgar/daily-index/", start_date=datetime.date.today(),
+              end_date=datetime.date.today()):
     date = start_date
     all_entries = []
     while date <= end_date:
@@ -168,15 +247,38 @@ def crawl_url(baseurl, start_date, end_date):
     return all_entries
 
 
+def read_json_config(file_path):
+    with open(file_path, "r") as f:
+        return json.load(f)
+
+
+def read_yaml_config(file_path):
+    with open(file_path, "r") as f:
+        return yaml.safe_load(f)
+
+
 # when you're ready to start querying, remember to connect
 def main():
+    config = read_json_config("config.json")
+    Database(
+        config["database"]["db"],
+        config["database"]["user"],
+        config["database"]["password"])
+    database_proxy.connect()
+    create_tbls()
     load_cik_ticker()
-    crawl_url(base_url, datetime.datetime(2021, 1, 1),
-              datetime.datetime(2021, 1, 31))
+
+    # IMPORTANT: Make sure to look into last_day_done.txt to get the new start year, start day and start month
+    # last_day_done.txt is the file which tells you upto when the backfill was done before script stopped thhe last
+    # time.
+    # crawl_url(config["query"]["base_url"],
+    #           datetime.datetime(int(config["query"]["start_year"]), int(config["query"]["start_month"]),
+    #                             int(config["query"]["start_date"])),
+    #           datetime.datetime(int(config["query"]["end_year"]), int(config["query"]["end_month"]),
+    #                             int(config["query"]["end_date"])))
+    crawl_url()
+    if not database_proxy.is_closed():
+        database_proxy.close()
 
 
-db.connect()
-create_tbls()
 main()
-if not db.is_closed():
-    db.close()

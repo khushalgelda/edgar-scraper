@@ -3,7 +3,7 @@ from datetime import datetime
 import peewee
 from playhouse.pool import PooledMySQLDatabase
 
-#db = peewee.MySQLDatabase("mydb", host="localhost", port=3306, user="root", passwd="root")
+# db = peewee.MySQLDatabase("mydb", host="localhost", port=3306, user="root", passwd="root")
 
 db = PooledMySQLDatabase(
     'mydb',
@@ -22,8 +22,8 @@ class BaseModel(peewee.Model):
 
 
 class CIK(BaseModel):
-    cik = peewee.IntegerField(unique=True)
-    ticker = peewee.CharField(max_length=15, unique=True)
+    cik = peewee.IntegerField()
+    ticker = peewee.CharField(max_length=15, null=True)
     indexes = (
         (('cik', 'ticker'), True),
     )
@@ -33,7 +33,7 @@ class CIK(BaseModel):
 
 
 class EdgarEntry(BaseModel):
-    cik = peewee.ForeignKeyField(CIK, backref='entries')
+    cik = peewee.ForeignKeyField(CIK, backref='entries', on_update='CASCADE')
     form_type = peewee.CharField(max_length=10)
     date = peewee.DateTimeField()
     html_link = peewee.CharField()
