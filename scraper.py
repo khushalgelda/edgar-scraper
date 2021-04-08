@@ -1,68 +1,13 @@
 import concurrent.futures
 import datetime
 import json
-import os
 
-import peewee
 import requests
 import yaml
 from bs4 import BeautifulSoup as soup
-from playhouse.db_url import connect
 from ratemate import RateLimit
+from edgarscraper.models.models import CIK, create_tbls, database_proxy, Database, EdgarEntry
 
-database_proxy = peewee.DatabaseProxy()
-
-
-class Database:
-    def __init__(self, db, user, passwd, max_connections=32, stale_timeout=32):
-        self.db = db
-        self.user = user
-        self.passwd = passwd
-        self.max_connection = max_connections
-        self.stale_timeout = stale_timeout
-        database_proxy.initialize(self.get_db())
-
-    def get_db(self):
-        return connect(os.environ.get('DATABASE') or 'mysql://root:root@0.tcp.ngrok.io:13604/mydb')
-
-
-class BaseModel(peewee.Model):
-    """A base model that will use our MySQL database"""
-    created = peewee.DateTimeField(default=datetime.datetime.now())
-
-    class Meta:
-        database = database_proxy
-
-
-class CIK(BaseModel):
-    cik = peewee.IntegerField()
-    ticker = peewee.CharField(max_length=15)
-    indexes = (
-        (('cik', 'ticker'), True),
-    )
-
-    def __enter__(self):
-        return self
-
-
-class EdgarEntry(BaseModel):
-    cik = peewee.ForeignKeyField(CIK, backref='entries')
-    form_type = peewee.CharField(max_length=10)
-    date = peewee.DateTimeField()
-    html_link = peewee.CharField()
-    doc_link = peewee.CharField()
-
-    def __enter__(self):
-        return self
-
-
-# simple utility function to create tables
-def create_tbls():
-    with database_proxy:
-        database_proxy.create_tables([CIK, EdgarEntry])
-
-
-base_url = 'https://www.sec.gov/Archives/edgar/daily-index/'
 rate_limit = RateLimit(max_count=10, per=1)
 # keeping CIK to ticker mapping in memory as well for fast access, this is supposed to be refreshed if the user
 # requested a ticker for which an entry in CIK table does not exist, we get CIK-Ticker mapping again from SEC and
@@ -222,7 +167,7 @@ def write_to_file(file, mssg):
     f.close()
 
 
-def create_url(baseurl, date):
+def create_url(base_url, date):
     if date.month <= 3:
         quarter = 'QTR1'
     elif date.month <= 6:
@@ -231,16 +176,16 @@ def create_url(baseurl, date):
         quarter = 'QTR3'
     else:
         quarter = 'QTR4'
-    url = baseurl + str(date.year) + '/' + quarter + '/' + 'master.' + date.strftime('%Y%m%d') + '.idx'
+    url = base_url + str(date.year) + '/' + quarter + '/' + 'master.' + date.strftime('%Y%m%d') + '.idx'
     return url
 
 
-def crawl_url(baseurl="https://www.sec.gov/Archives/edgar/daily-index/", start_date=datetime.date.today(),
+def crawl_url(base_url="https://www.sec.gov/Archives/edgar/daily-index/", start_date=datetime.date.today(),
               end_date=datetime.date.today()):
     date = start_date
     all_entries = []
     while date <= end_date:
-        url = create_url(baseurl, date)
+        url = create_url(base_url, date)
         print('Parsing data from {}'.format(url))
         all_entries.append(get_edgar_daily_objects(url))
         date = date + datetime.timedelta(days=1)
@@ -270,7 +215,7 @@ def main():
 
     # IMPORTANT: Make sure to look into last_day_done.txt to get the new start year, start day and start month
     # last_day_done.txt is the file which tells you upto when the backfill was done before script stopped thhe last
-    # time.
+    # time. LEAVING THE FOLLOWING COMMENTED CODE FOR USAGE REFERENCE
     # crawl_url(config["query"]["base_url"],
     #           datetime.datetime(int(config["query"]["start_year"]), int(config["query"]["start_month"]),
     #                             int(config["query"]["start_date"])),

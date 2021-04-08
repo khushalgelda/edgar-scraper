@@ -1,16 +1,23 @@
+import os
 from datetime import datetime
 
 import peewee
-from playhouse.pool import PooledMySQLDatabase
+from playhouse.db_url import connect
 
-# db = peewee.MySQLDatabase("mydb", host="localhost", port=3306, user="root", passwd="root")
+database_proxy = peewee.DatabaseProxy()
 
-db = PooledMySQLDatabase(
-    'mydb',
-    max_connections=32,
-    stale_timeout=300,  # 5 minutes.
-    user='root',
-    passwd='root')
+
+class Database:
+    def __init__(self, db, user, passwd, max_connections=32, stale_timeout=32):
+        self.db = db
+        self.user = user
+        self.passwd = passwd
+        self.max_connection = max_connections
+        self.stale_timeout = stale_timeout
+        database_proxy.initialize(self.get_db())
+
+    def get_db(self):
+        return connect(os.environ.get('DATABASE') or 'mysql://root:root@0.tcp.ngrok.io:13604/mydb')
 
 
 class BaseModel(peewee.Model):
@@ -18,7 +25,7 @@ class BaseModel(peewee.Model):
     created = peewee.DateTimeField(default=datetime.now())
 
     class Meta:
-        database = db
+        database = database_proxy
 
 
 class CIK(BaseModel):
@@ -42,5 +49,5 @@ class EdgarEntry(BaseModel):
 
 # simple utility function to create tables
 def create_tbls():
-    with db:
-        db.create_tables([CIK, EdgarEntry])
+    with database_proxy:
+        database_proxy.create_tables([CIK, EdgarEntry])
